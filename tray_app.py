@@ -29,10 +29,16 @@ except Exception:
     except Exception:
         pass
 
+def get_base_dir():
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
+
+
 APP_NAME = "PeripheralBatteryCenter"
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 PERSONALIZE_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
-CACHE_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "battery_cache.json")
+CACHE_FILE = os.path.join(get_base_dir(), "battery_cache.json")
 FLUENT_ICON_FONT_PATH = "C:/Windows/Fonts/SegoeIcons.ttf"
 
 
@@ -383,8 +389,11 @@ def query_hyperx_cloud2():
 # 2. 开机自启注册表管理
 # ============================================================================
 
-def get_launcher_vbs_path():
-    return os.path.join(os.path.dirname(os.path.abspath(__file__)), "启动电量托盘.vbs")
+def get_autostart_command():
+    if getattr(sys, "frozen", False):
+        return f'"{os.path.abspath(sys.executable)}"'
+    vbs_path = os.path.join(get_base_dir(), "启动电量托盘.vbs")
+    return f'wscript.exe "{vbs_path}"'
 
 
 def is_autostart_enabled():
@@ -402,8 +411,7 @@ def set_autostart_enabled(enable: bool):
     try:
         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, RUN_KEY_PATH, 0, winreg.KEY_SET_VALUE) as k:
             if enable:
-                vbs_path = get_launcher_vbs_path()
-                winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, f'wscript.exe "{vbs_path}"')
+                winreg.SetValueEx(k, APP_NAME, 0, winreg.REG_SZ, get_autostart_command())
             else:
                 try:
                     winreg.DeleteValue(k, APP_NAME)
@@ -910,7 +918,8 @@ class Win11BatteryFlyout:
                     try:
                         with winreg.OpenKey(winreg.HKEY_CURRENT_USER, sub_path, 0, winreg.KEY_READ | winreg.KEY_SET_VALUE) as sk:
                             exe_val, _ = winreg.QueryValueEx(sk, "ExecutablePath")
-                            if "Python" in str(exe_val) or "python" in str(exe_val):
+                            exe_str = str(exe_val).lower()
+                            if "python" in exe_str or "2.4gbattery" in exe_str:
                                 winreg.SetValueEx(sk, "IsPromoted", 0, winreg.REG_DWORD, 1)
                     except Exception:
                         pass
