@@ -28,13 +28,17 @@ jobs:
           python -m pip install --upgrade pip
           pip install -r requirements.txt pyinstaller
 
-      - name: Build single-file EXE with PyInstaller
+      - name: Inject tag version and build single-file EXE
+        shell: pwsh
         run: |
-          pyinstaller --noconfirm --onefile --windowed --name "2.4Gbattery" --icon "app.ico" --hidden-import "pystray._win32" --hidden-import "hid" tray_app.py
+          $tag = if ($env:GITHUB_REF_NAME -like "v*") { $env:GITHUB_REF_NAME } else { "v1.0.1" }
+          (Get-Content tray_app.py -Raw) -replace 'APP_VERSION = "[^"]*"', "APP_VERSION = `"$tag`"" | Set-Content tray_app.py -Encoding UTF8
+          $exeName = "2.4Gbattery_$tag"
+          pyinstaller --noconfirm --onefile --windowed --name "$exeName" --icon "app.ico" --hidden-import "pystray._win32" --hidden-import "hid" tray_app.py
 
       - name: Create GitHub Release and Upload EXE
         if: startsWith(github.ref, 'refs/tags/')
         uses: softprops/action-gh-release@v2
         with:
-          files: dist/2.4Gbattery.exe
+          files: dist/2.4Gbattery_*.exe
           generate_release_notes: true

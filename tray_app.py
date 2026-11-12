@@ -15,6 +15,8 @@ import sys
 import threading
 import time
 import tkinter as tk
+import urllib.request
+import webbrowser
 import winreg
 import hid
 from PIL import Image, ImageDraw, ImageFont, ImageTk
@@ -36,10 +38,68 @@ def get_base_dir():
 
 
 APP_NAME = "PeripheralBatteryCenter"
+APP_VERSION = "v1.0.1"
+GITHUB_REPO = "akapzg/2.4Gbattery"
+EXIT_EVENT_NAME = r"Local\PeripheralBatteryCenter_ExitEvent"
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 PERSONALIZE_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize"
 CACHE_FILE = os.path.join(get_base_dir(), "battery_cache.json")
 FLUENT_ICON_FONT_PATH = "C:/Windows/Fonts/SegoeIcons.ttf"
+
+
+def kill_previous_instances():
+    """
+    单实例接管：
+    1) 先触发命名退出事件通知支持优雅退出的旧实例主动移除托盘图标并退出；
+    2) 再通过 Win32 Toolhelp32 快照扫描并终止残留的旧版 2.4Gbattery*.exe 进程
+       （排除当前进程 os.getpid() 与 PyInstaller 父引导进程 os.getppid()）。
+    """
+    kernel32 = ctypes.windll.kernel32
+    EVENT_MODIFY_STATE = 0x0002
+    h_evt = kernel32.OpenEventW(EVENT_MODIFY_STATE, False, EXIT_EVENT_NAME)
+    if h_evt:
+        kernel32.SetEvent(h_evt)
+        kernel32.CloseHandle(h_evt)
+        time.sleep(0.25)
+
+    TH32CS_SNAPPROCESS = 0x00000002
+    PROCESS_TERMINATE = 0x0001
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [
+            ("dwSize", wintypes.DWORD),
+            ("cntUsage", wintypes.DWORD),
+            ("th32ProcessID", wintypes.DWORD),
+            ("th32DefaultHeapID", ctypes.c_size_t),
+            ("th32ModuleID", wintypes.DWORD),
+            ("cntThreads", wintypes.DWORD),
+            ("th32ParentProcessID", wintypes.DWORD),
+            ("pcPriClassBase", wintypes.LONG),
+            ("dwFlags", wintypes.DWORD),
+            ("szExeFile", wintypes.WCHAR * 260),
+        ]
+
+    my_pids = {os.getpid(), os.getppid()}
+    h_snap = kernel32.CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0)
+    if h_snap == wintypes.HANDLE(-1).value:
+        return
+
+    try:
+        pe = PROCESSENTRY32W()
+        pe.dwSize = ctypes.sizeof(PROCESSENTRY32W)
+        if kernel32.Process32FirstW(h_snap, ctypes.byref(pe)):
+            while True:
+                exe_name = pe.szExeFile.lower()
+                pid = pe.th32ProcessID
+                if exe_name.startswith("2.4gbattery") and exe_name.endswith(".exe") and pid not in my_pids:
+                    h_proc = kernel32.OpenProcess(PROCESS_TERMINATE, False, pid)
+                    if h_proc:
+                        kernel32.TerminateProcess(h_proc, 0)
+                        kernel32.CloseHandle(h_proc)
+                if not kernel32.Process32NextW(h_snap, ctypes.byref(pe)):
+                    break
+    finally:
+        kernel32.CloseHandle(h_snap)
 
 
 def load_battery_cache():
@@ -573,6 +633,9 @@ class Win11BatteryFlyout:
         self.show_timestamp = 0.0
         self.refreshing = False
         self.last_updated = "--:--:--"
+        self.update_status_text = APP_VERSION
+        self.latest_release_url = None
+        self.checking_update = False
 
         self.last_known_battery = {}
         if "keyboard" in cache and cache["keyboard"].get("battery") is not None:
@@ -584,10 +647,10 @@ class Win11BatteryFlyout:
             {"id": "headset", "name": "HyperX Cloud II Core", "Category": "耳机 · 2.4G", "online": False, "battery": None, "charging": False, "status_text": "正在读取..."},
         ]
 
-        # 顶部与底部图标按钮热区 (x0, y0, x1, y1)
+        # 顶部与底部热区 (x0, y0, x1, y1)
         self.theme_btn_rect = (self.WIDTH - 90, 14, self.WIDTH - 58, 46)
         self.refresh_btn_rect = (self.WIDTH - 50, 14, self.WIDTH - 18, 46)
-        self.autostart_btn_rect = (18, self.HEIGHT - 42, 168, self.HEIGHT - 14)
+        self.version_btn_rect = (18, self.HEIGHT - 40, 260, self.HEIGHT - 14)
         self.quit_btn_rect = (self.WIDTH - 48, self.HEIGHT - 42, self.WIDTH - 18, self.HEIGHT - 14)
         self.hover_target = None
 
@@ -655,8 +718,16 @@ class Win11BatteryFlyout:
             gy = y0 + (y1 - y0 - gh) // 2 - gb[1]
             draw.text((gx, gy), glyph, font=font, fill=color)
 
-        # 标题栏
-        draw.text((20 * s, 18 * s), "外设电量", font=f_title, fill=t["text_primary"])
+        # 标题栏 + 更新时间紧跟标题后方
+        title_str = "外设电量"
+        draw.text((20 * s, 18 * s), title_str, font=f_title, fill=t["text_primary"])
+        title_bbox = draw.textbbox((20 * s, 18 * s), title_str, font=f_title)
+        draw.text(
+            (title_bbox[2] + 10 * s, 23 * s),
+            f"更新于 {self.last_updated}",
+            font=f_sub,
+            fill=t["text_muted"],
+        )
 
         # 主题切换图标按钮 (太阳 0xE706 / 月亮 0xE708)
         tx0, ty0, tx1, ty1 = [v * s for v in self.theme_btn_rect]
@@ -760,22 +831,14 @@ class Win11BatteryFlyout:
                 bar_color = accent if online else t["bar_offline"]
                 draw.rounded_rectangle([bar_x0, bar_y0, bar_x0 + fill_w, bar_y1], radius=3 * s, fill=bar_color)
 
-        # 底部栏：开机自启开关 + 更新时间 + 退出按钮
-        autostart_on = is_autostart_enabled()
-        ax0, ay0, ax1, ay1 = [v * s for v in self.autostart_btn_rect]
-        a_bg = t["btn_hover"] if self.hover_target == "autostart" else t["btn_bg"]
-        draw.rounded_rectangle([ax0, ay0, ax1, ay1], radius=6 * s, fill=a_bg, outline=t["btn_border"], width=1 * s)
-        dot_color = get_battery_color(100, True, False, is_light) if autostart_on else t["text_muted"]
-        draw.ellipse([ax0 + 10 * s, ay0 + 9 * s, ax0 + 20 * s, ay0 + 19 * s], fill=dot_color)
-        draw.text(
-            (ax0 + 26 * s, ay0 + 5 * s),
-            f"开机自启: {'已开启' if autostart_on else '关闭'}",
-            font=f_sub,
-            fill=t["text_primary"],
-        )
-
-        # 更新时间
-        draw.text((196 * s, (self.HEIGHT - 34) * s), f"更新于 {self.last_updated}", font=f_sub, fill=t["text_muted"])
+        # 底部栏：左下角版本号文本（点击检查更新） + 右下角退出图标按钮
+        if self.latest_release_url:
+            ver_color = (0, 103, 192) if is_light else (96, 205, 255)
+        elif self.hover_target == "version":
+            ver_color = t["text_primary"]
+        else:
+            ver_color = t["text_muted"]
+        draw.text((20 * s, (self.HEIGHT - 34) * s), self.update_status_text, font=f_sub, fill=ver_color)
 
         # 退出图标按钮 (电源图标 0xE7E8)
         qx0, qy0, qx1, qy1 = [v * s for v in self.quit_btn_rect]
@@ -794,7 +857,7 @@ class Win11BatteryFlyout:
         for name, rect in [
             ("theme", self.theme_btn_rect),
             ("refresh", self.refresh_btn_rect),
-            ("autostart", self.autostart_btn_rect),
+            ("version", self.version_btn_rect),
             ("quit", self.quit_btn_rect),
         ]:
             if rect[0] <= x <= rect[2] and rect[1] <= y <= rect[3]:
@@ -814,11 +877,41 @@ class Win11BatteryFlyout:
             self.toggle_theme()
         elif target == "refresh":
             self.trigger_refresh()
-        elif target == "autostart":
-            set_autostart_enabled(not is_autostart_enabled())
-            self.render_flyout()
+        elif target == "version":
+            self.check_for_updates()
         elif target == "quit":
             self.quit_app()
+
+    def check_for_updates(self):
+        if self.latest_release_url:
+            webbrowser.open(self.latest_release_url)
+            return
+        if self.checking_update:
+            return
+        self.checking_update = True
+        self.update_status_text = f"{APP_VERSION} · 正在检查更新..."
+        self.render_flyout()
+
+        def _worker():
+            try:
+                url = f"https://api.github.com/repos/{GITHUB_REPO}/releases/latest"
+                req = urllib.request.Request(url, headers={"User-Agent": APP_NAME})
+                with urllib.request.urlopen(req, timeout=5) as resp:
+                    data = json.loads(resp.read().decode("utf-8"))
+                latest_tag = data.get("tag_name", "")
+                html_url = data.get("html_url", f"https://github.com/{GITHUB_REPO}/releases")
+                if latest_tag and latest_tag.lstrip("vV") != APP_VERSION.lstrip("vV"):
+                    self.latest_release_url = html_url
+                    self.update_status_text = f"{APP_VERSION} · 发现新版本 {latest_tag} (点击下载)"
+                else:
+                    self.update_status_text = f"{APP_VERSION} · 已是最新版本"
+            except Exception:
+                self.update_status_text = f"{APP_VERSION} · 检查更新失败 (点击重试)"
+            finally:
+                self.checking_update = False
+                self.root.after(0, lambda: self.render_flyout() if self.visible else None)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_focus_out(self, _event=None):
         if time.time() - self.show_timestamp < 1.5:
@@ -926,6 +1019,19 @@ class Win11BatteryFlyout:
         except Exception:
             pass
 
+    def _start_exit_event_listener(self):
+        """监听新实例发出的接管退出信号，收到后优雅移除托盘图标并退出"""
+        def _wait_loop():
+            kernel32 = ctypes.windll.kernel32
+            h_evt = kernel32.CreateEventW(None, True, False, EXIT_EVENT_NAME)
+            if not h_evt:
+                return
+            kernel32.WaitForSingleObject(h_evt, 0xFFFFFFFF)
+            kernel32.CloseHandle(h_evt)
+            self.root.after(0, self.quit_app)
+
+        threading.Thread(target=_wait_loop, daemon=True).start()
+
     def run(self):
         menu = pystray.Menu(
             pystray.MenuItem("打开/收起电量面板", lambda icon, item: self.root.after(0, self.toggle), default=True),
@@ -946,6 +1052,7 @@ class Win11BatteryFlyout:
             menu,
         )
         threading.Thread(target=self.tray_icon.run, daemon=True).start()
+        self._start_exit_event_listener()
         self.root.after(100, self._periodic_poll)
         self.root.after(600, self.show)
         self.root.after(1200, self._promote_tray_icon_in_win11)
@@ -953,5 +1060,8 @@ class Win11BatteryFlyout:
 
 
 if __name__ == "__main__":
+    kill_previous_instances()
+    if is_autostart_enabled():
+        set_autostart_enabled(True)
     app = Win11BatteryFlyout()
     app.run()
