@@ -1,0 +1,4 @@
+__pycache__/
+*.py[cod]
+battery_cache.json
+*.log
