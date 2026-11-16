@@ -38,7 +38,7 @@ def get_base_dir():
 
 
 APP_NAME = "PeripheralBatteryCenter"
-APP_VERSION = "v1.0.1"
+APP_VERSION = "v1.0.2"
 GITHUB_REPO = "akapzg/2.4Gbattery"
 EXIT_EVENT_NAME = r"Local\PeripheralBatteryCenter_ExitEvent"
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -290,7 +290,7 @@ def query_aula_f87pro():
         if not online:
             result["status_text"] = "已休眠"
         elif charging:
-            result["status_text"] = "充电中 ⚡"
+            result["status_text"] = "充电中"
         else:
             result["status_text"] = "无线使用中"
         return result
@@ -631,6 +631,8 @@ class Win11BatteryFlyout:
         self.photo = None
         self.visible = False
         self.show_timestamp = 0.0
+        self.last_auto_hide_ts = 0.0
+        self._outside_poll_id = None
         self.refreshing = False
         self.last_updated = "--:--:--"
         self.update_status_text = APP_VERSION
@@ -667,12 +669,14 @@ class Win11BatteryFlyout:
         self._apply_win11_corners()
         self.render_flyout()
 
+    def _get_hwnd(self):
+        hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
+        return hwnd if hwnd else self.root.winfo_id()
+
     def _apply_win11_corners(self):
         """调用 Windows 11 DWM API 启用原生圆角与浅/深色边框阴影"""
         try:
-            hwnd = ctypes.windll.user32.GetParent(self.root.winfo_id())
-            if not hwnd:
-                hwnd = self.root.winfo_id()
+            hwnd = self._get_hwnd()
             # DWMWA_WINDOW_CORNER_PREFERENCE = 33, DWMWCP_ROUND = 2
             pref = ctypes.c_int(2)
             ctypes.windll.dwmapi.DwmSetWindowAttribute(
@@ -914,29 +918,62 @@ class Win11BatteryFlyout:
         threading.Thread(target=_worker, daemon=True).start()
 
     def _on_focus_out(self, _event=None):
-        if time.time() - self.show_timestamp < 1.5:
+        if time.time() - self.show_timestamp < 0.25:
             return
-        self.hide()
+        self.hide(auto=True)
+
+    def _poll_outside_click(self):
+        self._outside_poll_id = None
+        if not self.visible:
+            return
+        if time.time() - self.show_timestamp >= 0.25:
+            user32 = ctypes.windll.user32
+            l_down = user32.GetAsyncKeyState(0x01) & 0x8000
+            r_down = user32.GetAsyncKeyState(0x02) & 0x8000
+            if l_down or r_down:
+                pt = wintypes.POINT()
+                rect = wintypes.RECT()
+                if user32.GetCursorPos(ctypes.byref(pt)) and user32.GetWindowRect(self._get_hwnd(), ctypes.byref(rect)):
+                    inside = (rect.left <= pt.x <= rect.right) and (rect.top <= pt.y <= rect.bottom)
+                    if not inside:
+                        self.hide(auto=True)
+                        return
+        self._outside_poll_id = self.root.after(60, self._poll_outside_click)
 
     def show(self):
+        if self._outside_poll_id is not None:
+            self.root.after_cancel(self._outside_poll_id)
+            self._outside_poll_id = None
         self.show_timestamp = time.time()
         self._position_near_tray()
         self.render_flyout()
         self.root.deiconify()
         self._apply_win11_corners()
         self.root.lift()
+        try:
+            ctypes.windll.user32.SetForegroundWindow(self._get_hwnd())
+        except Exception:
+            pass
         self.root.focus_force()
         self.visible = True
+        self._outside_poll_id = self.root.after(60, self._poll_outside_click)
 
-    def hide(self):
+    def hide(self, auto=False):
+        if self._outside_poll_id is not None:
+            self.root.after_cancel(self._outside_poll_id)
+            self._outside_poll_id = None
         if self.visible:
             self.root.withdraw()
             self.visible = False
+            if auto:
+                self.last_auto_hide_ts = time.time()
 
     def toggle(self):
         if self.visible:
             self.hide()
         else:
+            if time.time() - self.last_auto_hide_ts < 0.4:
+                return
             self.show()
             self.trigger_refresh()
 
@@ -970,7 +1007,7 @@ class Win11BatteryFlyout:
             lines = ["外设电量中心"]
             for d in self.devices:
                 if d["online"] and d["battery"] is not None:
-                    chg = " ⚡" if d["charging"] else ""
+                    chg = " (充电中)" if d["charging"] else ""
                     lines.append(f"{d['name']}: {d['battery']}%{chg}")
                 else:
                     cached = self.last_known_battery.get(d["id"])
