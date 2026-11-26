@@ -38,7 +38,7 @@ def get_base_dir():
 
 
 APP_NAME = "PeripheralBatteryCenter"
-APP_VERSION = "v1.0.2"
+APP_VERSION = "v1.0.3"
 GITHUB_REPO = "akapzg/2.4Gbattery"
 EXIT_EVENT_NAME = r"Local\PeripheralBatteryCenter_ExitEvent"
 RUN_KEY_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
@@ -257,22 +257,34 @@ def query_aula_f87pro():
                 if (sum(r[:19]) & 0xFF) == r[19]:
                     latest_0a = r
 
-        # 发送 0x4A 实时查询帧
+        # 发送 0x4A 实时查询帧（最多尝试 2 次，过滤非电量 0x0A 事件帧）
         pkt = [0x13, 0x4A] + [0x00] * 17
         pkt.append(sum(pkt) & 0xFF)
-        h.write(pkt)
 
         h.set_nonblocking(0)
-        resp = h.read(64, timeout_ms=400)
+        resp = None
+        for attempt in range(2):
+            h.write(pkt)
+            deadline = time.monotonic() + 0.5
+            while time.monotonic() < deadline:
+                r = h.read(64, timeout_ms=150)
+                if not r or len(r) < 20 or r[0] != 0x13:
+                    continue
+                if (sum(r[:19]) & 0xFF) != r[19]:
+                    continue
+                if r[1] == 0x4A or (r[1] == 0x0A and r[4] == 0x04 and r[5] == 0x05):
+                    resp = r
+                    break
+            if resp:
+                break
+            if attempt == 0:
+                time.sleep(0.1)
+
         if not resp and latest_0a:
             resp = latest_0a
 
         if not resp or len(resp) < 20 or resp[0] != 0x13:
             result["status_text"] = "已休眠 / 离线"
-            return result
-
-        if (sum(resp[:19]) & 0xFF) != resp[19]:
-            result["status_text"] = "校验异常"
             return result
 
         if resp[1] == 0x0A and resp[4] == 0x04 and resp[5] == 0x05:
